@@ -64,13 +64,16 @@ configured agent):
 
 config keys: agent, permission (auto|prompt), mcp (on|off),
              control (on|off), unsafe (on|off), writes (on|off),
-             timeout <seconds>, debug (on|off)
+             autoserve (on|off), timeout <seconds>, debug (on|off)
 
 `debug on` makes every acpdbg process log to ~/.acpdbg/acpdbg.log — follow it
 from a terminal with `tail -f` to see exactly where a session stalls.
 
 `control on` lets the agent drive execution — step, continue, set breakpoints —
 to debug interactively like a human.
+
+`autoserve on` runs `acpdbg serve` automatically whenever the program stops on
+a crash or breakpoint, and turns control on with it.
 """
 
 
@@ -134,13 +137,20 @@ def __lldb_init_module(debugger: lldb.SBDebugger, internal_dict: dict) -> None:
     # Used by the `acpdbg` CLI as a stop-hook one-liner; reads the question from
     # ACPDBG_QUESTION so no fragile nested quoting is needed on the command line.
     debugger.HandleCommand("command script add -f acpdbg.lldb_plugin._cmd_auto acpdbg-auto")
+    # Used by the autoserve stop-hook (see `acpdbg config autoserve on`).
+    debugger.HandleCommand("command script add -f acpdbg.lldb_plugin._cmd_autoserve acpdbg-autoserve")
+    if _CONFIG.autoserve:
+        # Baked into ~/.lldbinit (or set in the environment): arm the hook now.
+        # With no target yet it lands on the dummy target, which lldb copies to
+        # every target created afterwards.
+        _ensure_autoserve_hook(debugger)
     agent_commands = _register_agent_commands(debugger)
     commands = ", ".join(["ask", "why", "acpdbg", *agent_commands])
     py = f"{sys.version_info[0]}.{sys.version_info[1]}"
     _out(
         debugger,
         f"acpdbg {__version__} loaded — commands: {commands}  "
-        f"(agent: {_CONFIG.agent}; debugger Python {py}).\n"
+        f"(agent: {_CONFIG.agent}{'; autoserve on' if _CONFIG.autoserve else ''}; debugger Python {py}).\n"
         "  Stop your program (crash or breakpoint), then: ask why did this stop?\n",
     )
 
@@ -217,6 +227,18 @@ def _cmd_auto(debugger, command, result, internal_dict) -> None:
     _debug(debugger, question, result)
 
 
+def _cmd_autoserve(debugger, command, result, internal_dict) -> None:
+    # Fired from the autoserve stop-hook on every stop. Start the external
+    # bridge on the first genuine stop (crash or breakpoint, not the benign
+    # launch stops), and stay quiet once one is running — the stops an agent or
+    # external client causes while driving execution land here too.
+    if not _CONFIG.autoserve or _IN_SESSION or _SERVED_BRIDGE is not None:
+        return
+    if not LLDBInspector(debugger).is_reportable_stop():
+        return
+    _serve(debugger, "", result)
+
+
 def _cmd_acpdbg(debugger, command, result, internal_dict) -> None:
     args = (command or "").strip()
     if not args or args == "help":
@@ -224,7 +246,7 @@ def _cmd_acpdbg(debugger, command, result, internal_dict) -> None:
         return
     verb = args.split()[0]
     if verb == "config":
-        _config(args[len("config"):].strip(), result)
+        _config(debugger, args[len("config"):].strip(), result)
         return
     if verb == "serve":
         _serve(debugger, args[len("serve"):].strip(), result)
@@ -466,7 +488,26 @@ def _serve_message(control_on: bool) -> str:
     )
 
 
-def _config(args: str, result) -> None:
+# Whether this debugger already has the autoserve stop-hook (one config — and
+# one plugin instance — per debugger session, so a module flag is enough).
+_AUTOSERVE_HOOK_ADDED = False
+
+
+def _ensure_autoserve_hook(debugger) -> None:
+    """Arm the stop-hook that serves the session whenever the program stops.
+
+    Added at most once. With no target yet, lldb puts the hook on the dummy
+    target and copies it to every target created later, so this also works from
+    ~/.lldbinit. The hook itself is a no-op while autoserve is off.
+    """
+    global _AUTOSERVE_HOOK_ADDED
+    if _AUTOSERVE_HOOK_ADDED:
+        return
+    debugger.HandleCommand("target stop-hook add --one-liner acpdbg-autoserve")
+    _AUTOSERVE_HOOK_ADDED = True
+
+
+def _config(debugger, args: str, result) -> None:
     if not args:
         result.AppendMessage(_render_config())
         return
@@ -478,14 +519,23 @@ def _config(args: str, result) -> None:
     key, value = parts[0].lower(), " ".join(parts[1:])
 
     try:
-        _apply_config(key, value)
+        note = _apply_config(key, value)
     except ValueError as exc:
         result.SetError(str(exc))
         return
+    if note:
+        result.AppendMessage(f"acpdbg: {note}")
     result.AppendMessage(_render_config())
 
+    if key == "autoserve" and _CONFIG.autoserve:
+        _ensure_autoserve_hook(debugger)
+        # If the program is already stopped, don't wait for the next stop.
+        if _SERVED_BRIDGE is None and LLDBInspector(debugger).stopped_thread() is not None:
+            _serve(debugger, "", result)
 
-def _apply_config(key: str, value: str) -> None:
+
+def _apply_config(key: str, value: str) -> "str | None":
+    """Set one config key; returns an optional note for the console."""
     on = value.lower() in ("on", "1", "true", "yes")
     if key == "agent":
         _CONFIG.agent = value
@@ -501,6 +551,13 @@ def _apply_config(key: str, value: str) -> None:
         _CONFIG.unsafe = on
     elif key in ("writes", "allow_writes"):
         _CONFIG.allow_writes = on
+    elif key == "autoserve":
+        _CONFIG.autoserve = on
+        if on and not _CONFIG.allow_control:
+            # A read-only auto-served bridge is rarely useful; turn control on
+            # too. `acpdbg config control off` afterwards undoes it.
+            _CONFIG.allow_control = True
+            return "autoserve implies control — turned control on as well."
     elif key == "timeout":
         _CONFIG.prompt_timeout = float(value)
     elif key == "debug":
@@ -510,6 +567,7 @@ def _apply_config(key: str, value: str) -> None:
             _log.debug("plugin", f"debug logging enabled (acpdbg {__version__})")
     else:
         raise ValueError(f"unknown config key: {key}")
+    return None
 
 
 def _render_config() -> str:
@@ -519,6 +577,7 @@ def _render_config() -> str:
         f"  permission = {_CONFIG.permission_mode}\n"
         f"  mcp        = {'on' if _CONFIG.use_mcp else 'off'}\n"
         f"  control    = {'on' if _CONFIG.allow_control else 'off'}\n"
+        f"  autoserve  = {'on' if _CONFIG.autoserve else 'off'}\n"
         f"  unsafe     = {'on' if _CONFIG.unsafe else 'off'}\n"
         f"  writes     = {'on' if _CONFIG.allow_writes else 'off'}\n"
         f"  timeout    = {_CONFIG.prompt_timeout:g}s\n"

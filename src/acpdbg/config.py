@@ -51,6 +51,9 @@ class Config:
     # Let the agent drive execution (step/continue/breakpoints), like a human
     # debugger. Off by default: in crash triage you rarely want to resume.
     allow_control: bool = False
+    # Automatically expose stopped sessions to external MCP clients (see
+    # `acpdbg serve`). Implies control unless ACPDBG_CONTROL says otherwise.
+    autoserve: bool = False
     # Forward the agent subprocess's stderr (useful when debugging the agent).
     agent_stderr: bool = False
     # Seconds to wait for the agent to finish a turn (0 disables the timeout).
@@ -60,13 +63,17 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        # Autoserve defaults control to on (a read-only external bridge is rarely
+        # what you want); an explicit ACPDBG_CONTROL still wins either way.
+        autoserve = _truthy(os.environ.get("ACPDBG_AUTOSERVE"), False)
         return cls(
             agent=os.environ.get("ACPDBG_AGENT", "mock"),
             permission_mode=os.environ.get("ACPDBG_PERMISSION", "auto"),
             allow_writes=_truthy(os.environ.get("ACPDBG_ALLOW_WRITES"), False),
             use_mcp=_truthy(os.environ.get("ACPDBG_MCP"), True),
             unsafe=_truthy(os.environ.get("ACPDBG_UNSAFE"), False),
-            allow_control=_truthy(os.environ.get("ACPDBG_CONTROL"), False),
+            allow_control=_truthy(os.environ.get("ACPDBG_CONTROL"), autoserve),
+            autoserve=autoserve,
             agent_stderr=_truthy(os.environ.get("ACPDBG_AGENT_STDERR"), False),
             prompt_timeout=float(os.environ.get("ACPDBG_TIMEOUT", "300") or 300),
             debug=_truthy(os.environ.get("ACPDBG_DEBUG"), False),
@@ -120,6 +127,7 @@ class Config:
             "ACPDBG_MCP": "1" if self.use_mcp else "0",
             "ACPDBG_UNSAFE": "1" if self.unsafe else "0",
             "ACPDBG_CONTROL": "1" if self.allow_control else "0",
+            "ACPDBG_AUTOSERVE": "1" if self.autoserve else "0",
             "ACPDBG_AGENT_STDERR": "1" if self.agent_stderr else "0",
             "ACPDBG_TIMEOUT": str(self.prompt_timeout),
             "ACPDBG_DEBUG": "1" if self.debug else "0",

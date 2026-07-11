@@ -54,12 +54,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--unsafe", action="store_true", help="Disable the debugger-command safety filter.")
     parser.add_argument("--writes", action="store_true", help="Let the agent write files (e.g. apply a fix).")
+    parser.add_argument(
+        "--autoserve", action="store_true",
+        help="Expose the session to external MCP clients automatically whenever "
+             "the program stops (implies --control). See `acpdbg serve`.",
+    )
     parser.add_argument("--agent-stderr", action="store_true", help="Show the agent subprocess's stderr.")
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Log every acpdbg process to ~/.acpdbg/acpdbg.log.",
+    )
     parser.add_argument("--lldb", default=None, help="Path to the lldb executable (default: found on PATH).")
     parser.add_argument("--dry-run", action="store_true", help="Print the lldb command that would run and exit.")
     parser.add_argument(
         "--install-lldbinit", action="store_true",
-        help="Add acpdbg to your ~/.lldbinit so `ask`/`why` load in every lldb session, then exit.",
+        help="Add acpdbg to your ~/.lldbinit so `ask`/`why` load in every lldb session, "
+             "then exit. Options given alongside (--agent, --control, --debug, "
+             "--autoserve, …) are baked in as session defaults.",
     )
     parser.add_argument(
         "--print-lldbinit", action="store_true",
@@ -91,8 +102,12 @@ def _child_env(args: argparse.Namespace) -> dict[str, str]:
         env["ACPDBG_UNSAFE"] = "1"
     if args.writes:
         env["ACPDBG_ALLOW_WRITES"] = "1"
+    if args.autoserve:
+        env["ACPDBG_AUTOSERVE"] = "1"
     if args.agent_stderr:
         env["ACPDBG_AGENT_STDERR"] = "1"
+    if args.debug:
+        env["ACPDBG_DEBUG"] = "1"
     env["ACPDBG_QUESTION"] = args.question
 
     # Make the acpdbg package importable from lldb's bundled Python. Only the
@@ -163,14 +178,43 @@ def _agent_bin_dir(agent: str) -> str:
     return os.path.dirname(exe) if os.path.isabs(exe) else ""
 
 
-def lldbinit_block(agent: str | None = None) -> str:
+def lldbinit_env(args: argparse.Namespace) -> dict[str, str]:
+    """ACPDBG_* defaults to bake into ~/.lldbinit for non-default CLI options.
+
+    Only options that differ from the built-in defaults are recorded, and each
+    is written with ``setdefault`` so a real environment variable at lldb's
+    launch still wins.
+    """
+    env: dict[str, str] = {}
+    if args.permission is not None:
+        env["ACPDBG_PERMISSION"] = args.permission
+    if args.no_mcp:
+        env["ACPDBG_MCP"] = "0"
+    if args.control:
+        env["ACPDBG_CONTROL"] = "1"
+    if args.unsafe:
+        env["ACPDBG_UNSAFE"] = "1"
+    if args.writes:
+        env["ACPDBG_ALLOW_WRITES"] = "1"
+    if args.autoserve:
+        env["ACPDBG_AUTOSERVE"] = "1"
+    if args.agent_stderr:
+        env["ACPDBG_AGENT_STDERR"] = "1"
+    if args.debug:
+        env["ACPDBG_DEBUG"] = "1"
+    return env
+
+
+def lldbinit_block(agent: str | None = None, extra_env: dict[str, str] | None = None) -> str:
     """The self-contained snippet that makes lldb load the acpdbg commands.
 
     The plugin itself is pure standard library, so it only needs acpdbg's own
     directory on the path (appended, so it can't shadow lldb's stdlib). The agent
     helper runs out-of-process, so its path is recorded separately. When an
     ``agent`` is given, it is baked in as the default (with its bin directory
-    added to PATH) so it works from GUI-launched debuggers like Xcode.
+    added to PATH) so it works from GUI-launched debuggers like Xcode; any
+    ``extra_env`` ACPDBG_* defaults (see :func:`lldbinit_env`) are baked in the
+    same way.
     """
     lines = [
         _LLDBINIT_BEGIN,
@@ -193,6 +237,10 @@ def lldbinit_block(agent: str | None = None) -> str:
         lines.append(
             f"script import os; _ = os.environ.setdefault('ACPDBG_AGENT', {agent!r})"
         )
+    for key, value in (extra_env or {}).items():
+        lines.append(
+            f"script import os; _ = os.environ.setdefault({key!r}, {value!r})"
+        )
     lines += [
         "command script import acpdbg.lldb_plugin",
         _LLDBINIT_END,
@@ -201,8 +249,8 @@ def lldbinit_block(agent: str | None = None) -> str:
     return "\n".join(lines)
 
 
-def install_lldbinit(path: str, agent: str | None = None) -> None:
-    block = lldbinit_block(agent)
+def install_lldbinit(path: str, agent: str | None = None, extra_env: dict[str, str] | None = None) -> None:
+    block = lldbinit_block(agent, extra_env)
     existing = ""
     if os.path.exists(path):
         with open(path, "r") as handle:
@@ -221,7 +269,9 @@ def install_lldbinit(path: str, agent: str | None = None) -> None:
 
     with open(path, "w") as handle:
         handle.write(updated)
-    print(f"{action} {path}." + (f" Default agent: {agent}." if agent else ""))
+    baked = [f"agent={agent}"] if agent else []
+    baked += [f"{k}={v}" for k, v in (extra_env or {}).items()]
+    print(f"{action} {path}." + (f" Baked-in defaults: {', '.join(baked)}." if baked else ""))
     print("Open any program with `lldb ./a.out`; after it stops, run `ask why did this stop?`")
     _warn_on_python_mismatch()
 
@@ -259,11 +309,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.print_lldbinit:
-        print(lldbinit_block(args.agent), end="")
+        print(lldbinit_block(args.agent, lldbinit_env(args)), end="")
         return 0
     if args.install_lldbinit:
         path = args.lldbinit_path or os.path.expanduser("~/.lldbinit")
-        install_lldbinit(path, args.agent)
+        install_lldbinit(path, args.agent, lldbinit_env(args))
         return 0
 
     program = _strip_separator(args.program)

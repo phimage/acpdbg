@@ -5,8 +5,10 @@ from acpdbg.cli import (
     _LLDBINIT_BEGIN,
     _strip_separator,
     build_lldb_command,
+    build_parser,
     install_lldbinit,
     lldbinit_block,
+    lldbinit_env,
 )
 from acpdbg.config import Config, resolve_session_command
 from acpdbg.context import Arg, CrashContext, Frame, SkippedFrames
@@ -113,6 +115,38 @@ def test_lldbinit_block_bakes_agent():
     assert "os.environ.setdefault('ACPDBG_AGENT', 'copilot')" in block
     # No agent baked when none requested.
     assert "ACPDBG_AGENT" not in lldbinit_block()
+
+
+def test_lldbinit_env_records_only_non_default_options():
+    parser = build_parser()
+    assert lldbinit_env(parser.parse_args(["--install-lldbinit"])) == {}
+    env = lldbinit_env(parser.parse_args(
+        ["--install-lldbinit", "--control", "--debug", "--permission", "prompt"]
+    ))
+    assert env == {
+        "ACPDBG_CONTROL": "1",
+        "ACPDBG_DEBUG": "1",
+        "ACPDBG_PERMISSION": "prompt",
+    }
+
+
+def test_lldbinit_block_bakes_extra_env_as_setdefault():
+    block = lldbinit_block(extra_env={"ACPDBG_CONTROL": "1", "ACPDBG_AUTOSERVE": "1"})
+    assert "os.environ.setdefault('ACPDBG_CONTROL', '1')" in block
+    assert "os.environ.setdefault('ACPDBG_AUTOSERVE', '1')" in block
+    assert "ACPDBG_CONTROL" not in lldbinit_block()
+
+
+def test_autoserve_env_implies_control(monkeypatch):
+    monkeypatch.setenv("ACPDBG_AUTOSERVE", "1")
+    config = Config.from_env()
+    assert config.autoserve is True
+    assert config.allow_control is True
+    # An explicit ACPDBG_CONTROL still wins.
+    monkeypatch.setenv("ACPDBG_CONTROL", "0")
+    config = Config.from_env()
+    assert config.autoserve is True
+    assert config.allow_control is False
 
 
 def test_install_lldbinit_is_idempotent_and_preserves_content(tmp_path):

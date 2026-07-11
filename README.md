@@ -123,6 +123,7 @@ Commands added to LLDB:
 | `acpdbg <question>` | Same as `ask`. |
 | `acpdbg config` | Show configuration. |
 | `acpdbg config <key> <value>` | Change a setting (see below). |
+| `acpdbg serve` / `acpdbg serve stop` | Expose the session to an external MCP client (see below). |
 | `copilot <question>` | Ask GitHub Copilot CLI, one-off. |
 | `claude <question>` | Ask Claude Code (via the ACP adapter), one-off. |
 | `gemini <question>` | Ask Gemini CLI, one-off. |
@@ -242,6 +243,18 @@ session is `serve`-ing, that app can call `get_backtrace`, `get_locals`,
 > app is driving it — one driver at a time. The bridge is a local, token-guarded
 > socket that only exists while you're serving.
 
+Don't want to type `acpdbg serve` every time? Turn on **autoserve** and every
+session serves itself on the first crash or breakpoint (it turns control on
+with it — run `acpdbg config control off` afterwards if you want read-only):
+
+```lldb
+(lldb) acpdbg config autoserve on   # this session; serves now if already stopped
+```
+
+```bash
+acpdbg --install-lldbinit --autoserve   # every session, including Xcode
+```
+
 ## How it works
 
 ```
@@ -288,11 +301,20 @@ Every option is available as a CLI flag, an environment variable, or the
 | Permission handling | `--permission auto\|prompt` | `ACPDBG_PERMISSION` | `auto` |
 | Live debugger tools | `--no-mcp` to disable | `ACPDBG_MCP` | on |
 | Execution control (step/continue) | `--control` | `ACPDBG_CONTROL` | off |
+| Auto-serve stopped sessions (implies control) | `--autoserve` | `ACPDBG_AUTOSERVE` | off |
 | Allow file writes | `--writes` | `ACPDBG_ALLOW_WRITES` | off |
 | Disable safety filter | `--unsafe` | `ACPDBG_UNSAFE` | off |
 | Agent turn timeout (s) | — | `ACPDBG_TIMEOUT` | `300` |
 | Show agent stderr | `--agent-stderr` | `ACPDBG_AGENT_STDERR` | off |
-| Debug log | — | `ACPDBG_DEBUG` | off |
+| Debug log | `--debug` | `ACPDBG_DEBUG` | off |
+
+Any of these given alongside `--install-lldbinit` is baked into `~/.lldbinit`
+as a session default (a real environment variable still overrides it), so they
+also apply under GUI debuggers like Xcode:
+
+```bash
+acpdbg --install-lldbinit --agent copilot --control --debug
+```
 
 ## Troubleshooting (especially inside Xcode)
 
