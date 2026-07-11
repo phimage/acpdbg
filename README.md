@@ -123,6 +123,7 @@ Commands added to LLDB:
 | `acpdbg <question>` | Same as `ask`. |
 | `acpdbg config` | Show configuration. |
 | `acpdbg config <key> <value>` | Change a setting (see below). |
+| `acpdbg session [start\|stop\|reset]` | Manage the persistent agent conversation (see below). |
 | `acpdbg serve` / `acpdbg serve stop` | Expose the session to an external MCP client (see below). |
 | `copilot <question>` | Ask GitHub Copilot CLI, one-off. |
 | `claude <question>` | Ask Claude Code (via the ACP adapter), one-off. |
@@ -194,6 +195,39 @@ inspect anything else it needs:
 Process stopped at breakpoint 1.1
 (lldb) ask why is `retry_count` already 3 here? which caller set it?
 ```
+
+### Ask follow-ups — the agent remembers (persistent sessions)
+
+By default the **first `ask` opens one persistent agent conversation and every
+later ask continues it**: the agent remembers its earlier findings, and the
+agent's startup cost (minutes, for some CLIs) is paid once per debug session
+instead of once per question.
+
+```lldb
+(lldb) ask why did this crash?
+acpdbg → copilot (starting the persistent session — later asks reuse it)
+...
+(lldb) ask and what's the smallest safe fix?
+acpdbg → copilot (session turn 2)          # same conversation, instant start
+```
+
+Follow-ups send only your question. If the program has stopped *anew* since the
+last ask (a re-run, the next breakpoint), acpdbg notices and resends fresh
+context automatically, telling the agent its earlier live state is stale.
+
+```lldb
+(lldb) acpdbg session          # status: agent, turns, uptime
+(lldb) acpdbg session reset    # forget the conversation, keep the agent warm
+(lldb) acpdbg session stop     # end it (the next ask opens a fresh one)
+(lldb) acpdbg session start    # open one explicitly, before any ask
+```
+
+`acpdbg config session off` (or `--no-session`, or `ACPDBG_SESSION=0`) restores
+the old behavior — a fresh one-shot agent per ask. Asking a *different* agent
+(e.g. a one-off `gemini <question>` while the session is with copilot) runs
+one-shot without disturbing the conversation. One caveat: `permission prompt`
+mode needs the console for its interactive approvals, so those asks always run
+one-shot.
 
 ### Let the agent drive execution (debug like a human)
 
@@ -301,6 +335,7 @@ Every option is available as a CLI flag, an environment variable, or the
 | Permission handling | `--permission auto\|prompt` | `ACPDBG_PERMISSION` | `auto` |
 | Live debugger tools | `--no-mcp` to disable | `ACPDBG_MCP` | on |
 | Execution control (step/continue) | `--control` | `ACPDBG_CONTROL` | off |
+| Persistent agent conversation | `--no-session` to disable | `ACPDBG_SESSION` | on |
 | Auto-serve stopped sessions (implies control) | `--autoserve` | `ACPDBG_AUTOSERVE` | off |
 | Allow file writes | `--writes` | `ACPDBG_ALLOW_WRITES` | off |
 | Disable safety filter | `--unsafe` | `ACPDBG_UNSAFE` | off |

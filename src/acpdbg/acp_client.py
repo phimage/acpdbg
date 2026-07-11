@@ -274,41 +274,61 @@ def _mcp_server(config: Config, bridge: BridgeInfo) -> McpServerStdio:
     )
 
 
-async def _run_session(
-    config: Config,
-    prompt_text: str,
-    *,
-    bridge: Optional[BridgeInfo],
-    printer: ConsolePrinter,
-    cwd: str,
-) -> None:
-    argv = config.agent_argv()
-    # In debug mode capture the agent's stderr into the log — agent CLIs report
-    # auth and startup failures there, which would otherwise vanish.
-    stderr_sink = None if config.agent_stderr else log.stderr_sink("session")
-    if config.agent_stderr:
-        stderr = None
-    elif stderr_sink is not None:
-        stderr = stderr_sink
-    else:
-        stderr = asyncio.subprocess.DEVNULL
-    log.debug("session", f"spawning agent: {' '.join(argv)}")
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=stderr,
-    )
-    log.debug("session", f"agent pid={proc.pid}")
-    if proc.stdin is None or proc.stdout is None:
-        raise RuntimeError("agent process did not expose stdio pipes")
+class AgentSession:
+    """A live ACP conversation: one agent process, one session id, many turns.
 
-    client = DebuggerClient(config, printer, cwd)
-    conn = connect_to_agent(client, proc.stdin, proc.stdout)
-    try:
+    ``start()`` spawns the agent and opens the session (the expensive part —
+    some agents take minutes); each ``prompt()`` then runs one turn on it, so
+    the agent keeps its memory of earlier turns. ``reset()`` starts a fresh
+    conversation without restarting the agent process. Always ``close()``.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        bridge: Optional[BridgeInfo] = None,
+        printer: Optional[ConsolePrinter] = None,
+        cwd: Optional[str] = None,
+    ) -> None:
+        self._config = config
+        self._bridge = bridge
+        self._printer = printer or ConsolePrinter()
+        self._cwd = cwd or os.getcwd()
+        self._proc = None
+        self._conn = None
+        self._stderr_sink = None
+        self._session_id: Optional[str] = None
+
+    async def start(self) -> None:
+        config = self._config
+        argv = config.agent_argv()
+        # In debug mode capture the agent's stderr into the log — agent CLIs
+        # report auth and startup failures there, which would otherwise vanish.
+        self._stderr_sink = None if config.agent_stderr else log.stderr_sink("session")
+        if config.agent_stderr:
+            stderr = None
+        elif self._stderr_sink is not None:
+            stderr = self._stderr_sink
+        else:
+            stderr = asyncio.subprocess.DEVNULL
+        log.debug("session", f"spawning agent: {' '.join(argv)}")
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=stderr,
+        )
+        self._proc = proc
+        log.debug("session", f"agent pid={proc.pid}")
+        if proc.stdin is None or proc.stdout is None:
+            raise RuntimeError("agent process did not expose stdio pipes")
+
+        client = DebuggerClient(config, self._printer, self._cwd)
+        self._conn = connect_to_agent(client, proc.stdin, proc.stdout)
         log.debug("acp", "initialize →")
         await _with_heartbeat(
-            conn.initialize(
+            self._conn.initialize(
                 protocol_version=PROTOCOL_VERSION,
                 client_capabilities=ClientCapabilities(
                     fs=FileSystemCapabilities(
@@ -318,43 +338,89 @@ async def _run_session(
                 ),
                 client_info=Implementation(name="acpdbg", title="acpdbg", version=__version__),
             ),
-            printer,
+            self._printer,
             f"{config.agent} is initializing",
         )
         log.debug("acp", "initialize ← ok")
-        mcp_servers = [_mcp_server(config, bridge)] if bridge is not None else []
+        await self._new_session()
+
+    async def _new_session(self) -> None:
+        mcp_servers = [_mcp_server(self._config, self._bridge)] if self._bridge is not None else []
         log.debug("acp", f"session/new → (mcp servers: {len(mcp_servers)})")
         # Some agents (Copilot CLI, for one) take minutes here; without feedback
         # this silence is indistinguishable from a hang.
         session = await _with_heartbeat(
-            conn.new_session(cwd=cwd, mcp_servers=mcp_servers),
-            printer,
-            f"{config.agent} is starting the session",
+            self._conn.new_session(cwd=self._cwd, mcp_servers=mcp_servers),
+            self._printer,
+            f"{self._config.agent} is starting the session",
         )
+        self._session_id = session.session_id
         log.debug("acp", f"session/new ← id={session.session_id}")
 
-        log.debug("acp", f"session/prompt → ({len(prompt_text)} chars, timeout={config.prompt_timeout:g}s)")
-        request = conn.prompt(session_id=session.session_id, prompt=[text_block(prompt_text)])
+    async def reset(self) -> None:
+        """Forget the conversation: open a fresh session on the same agent."""
+        await self._new_session()
+
+    async def prompt(self, prompt_text: str) -> None:
+        config = self._config
+        log.debug(
+            "acp",
+            f"session/prompt → ({len(prompt_text)} chars, timeout={config.prompt_timeout:g}s)",
+        )
+        request = self._conn.prompt(
+            session_id=self._session_id, prompt=[text_block(prompt_text)]
+        )
         timeout = config.prompt_timeout
-        if timeout and timeout > 0:
-            try:
-                await asyncio.wait_for(request, timeout=timeout)
+        try:
+            if timeout and timeout > 0:
+                try:
+                    await asyncio.wait_for(request, timeout=timeout)
+                    log.debug("acp", "session/prompt ← turn complete")
+                except asyncio.TimeoutError:
+                    log.debug("acp", f"session/prompt TIMED OUT after {timeout:.0f}s")
+                    self._printer.note(f"(agent timed out after {timeout:.0f}s)")
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(
+                            self._conn.cancel(session_id=self._session_id), timeout=2
+                        )
+            else:
+                await request
                 log.debug("acp", "session/prompt ← turn complete")
-            except asyncio.TimeoutError:
-                log.debug("acp", f"session/prompt TIMED OUT after {timeout:.0f}s")
-                printer.note(f"(agent timed out after {timeout:.0f}s)")
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(conn.cancel(session_id=session.session_id), timeout=2)
-        else:
-            await request
-            log.debug("acp", "session/prompt ← turn complete")
-    finally:
-        printer.finish()
-        await _shutdown(proc, conn)
-        log.debug("session", f"agent shut down (returncode={proc.returncode})")
-        if stderr_sink is not None:
+        finally:
+            # The SDK runs each session_update notification on its own task but
+            # resolves the prompt future directly in the receive loop, so the
+            # turn can "complete" before the final chunk was printed. The pipe
+            # delivered those updates before the response, so they are already
+            # queued in-process: a few event-loop cycles let them land before we
+            # report the turn finished (the persistent helper prints its
+            # end-of-turn sentinel right after this returns).
+            for _ in range(10):
+                await asyncio.sleep(0)
+            self._printer.finish()
+
+    async def close(self) -> None:
+        if self._proc is not None:
+            await _shutdown(self._proc, self._conn)
+            log.debug("session", f"agent shut down (returncode={self._proc.returncode})")
+        if self._stderr_sink is not None:
             with contextlib.suppress(OSError):
-                stderr_sink.close()
+                self._stderr_sink.close()
+
+
+async def _run_session(
+    config: Config,
+    prompt_text: str,
+    *,
+    bridge: Optional[BridgeInfo],
+    printer: ConsolePrinter,
+    cwd: str,
+) -> None:
+    session = AgentSession(config, bridge=bridge, printer=printer, cwd=cwd)
+    try:
+        await session.start()
+        await session.prompt(prompt_text)
+    finally:
+        await session.close()
 
 
 async def _with_heartbeat(awaitable, printer: ConsolePrinter, label: str, interval: float = 20.0):

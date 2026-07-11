@@ -137,6 +137,17 @@ def test_lldbinit_block_bakes_extra_env_as_setdefault():
     assert "ACPDBG_CONTROL" not in lldbinit_block()
 
 
+def test_session_config(monkeypatch):
+    assert Config().session is True                     # persistent by default
+    monkeypatch.setenv("ACPDBG_SESSION", "0")
+    assert Config.from_env().session is False
+
+    parser = build_parser()
+    assert "ACPDBG_SESSION" not in lldbinit_env(parser.parse_args(["--install-lldbinit"]))
+    env = lldbinit_env(parser.parse_args(["--install-lldbinit", "--no-session"]))
+    assert env["ACPDBG_SESSION"] == "0"
+
+
 def test_autoserve_env_implies_control(monkeypatch):
     monkeypatch.setenv("ACPDBG_AUTOSERVE", "1")
     config = Config.from_env()

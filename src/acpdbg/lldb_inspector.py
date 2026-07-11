@@ -133,6 +133,20 @@ class LLDBInspector:
             return False
         return not any(sig in description for sig in ("SIGSTOP", "SIGCONT"))
 
+    def stop_generation(self) -> "tuple | None":
+        """A marker that changes whenever the program stops anew.
+
+        Used by the persistent-session flow to notice that live state moved on
+        (a re-run, a next breakpoint) and resend fresh context to the agent.
+        """
+        target = self._debugger.GetSelectedTarget()
+        if not target:
+            return None
+        process = target.GetProcess()
+        if not process or not process.IsValid():
+            return None
+        return (process.GetUniqueID(), process.GetStopID())
+
     def is_debug_build(self) -> bool:
         target = self._debugger.GetSelectedTarget()
         if not target:

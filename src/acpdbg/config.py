@@ -36,6 +36,24 @@ class ConfigError(Exception):
     """Raised when the configured agent cannot be launched."""
 
 
+# --- plugin ↔ helper wire protocol for persistent sessions ------------------
+# These live here (not in session.py) because the lldb plugin — running in the
+# debugger's possibly-ancient embedded Python — may import only stdlib-level
+# acpdbg modules, and session.py pulls in the ACP SDK.
+#
+# The plugin spawns `acpdbg-session` with SESSION_PERSISTENT_ENV=1 and writes
+# one command per line to its stdin:
+#     PROMPT <path>   run one turn with the prompt text read from <path>
+#     RESET           start a fresh conversation on the same agent process
+# stdin EOF ends the helper (so it dies with the debugger). The helper streams
+# agent output on stdout and marks each command's completion with a line
+# starting with SESSION_TURN_END followed by a status word: "ready" (once,
+# after startup), then "ok" or "error". The \x1e record separator makes a
+# collision with genuine agent output effectively impossible.
+SESSION_PERSISTENT_ENV = "ACPDBG_PERSISTENT"
+SESSION_TURN_END = "\x1e##acpdbg-turn-end##"
+
+
 @dataclass
 class Config:
     # Agent alias ("mock", "gemini", "claude-code") or a raw command line.
@@ -54,6 +72,9 @@ class Config:
     # Automatically expose stopped sessions to external MCP clients (see
     # `acpdbg serve`). Implies control unless ACPDBG_CONTROL says otherwise.
     autoserve: bool = False
+    # Keep one agent conversation alive across asks (the agent remembers earlier
+    # answers and startup cost is paid once). Off = a fresh one-shot per ask.
+    session: bool = True
     # Forward the agent subprocess's stderr (useful when debugging the agent).
     agent_stderr: bool = False
     # Seconds to wait for the agent to finish a turn (0 disables the timeout).
@@ -74,6 +95,7 @@ class Config:
             unsafe=_truthy(os.environ.get("ACPDBG_UNSAFE"), False),
             allow_control=_truthy(os.environ.get("ACPDBG_CONTROL"), autoserve),
             autoserve=autoserve,
+            session=_truthy(os.environ.get("ACPDBG_SESSION"), True),
             agent_stderr=_truthy(os.environ.get("ACPDBG_AGENT_STDERR"), False),
             prompt_timeout=float(os.environ.get("ACPDBG_TIMEOUT", "300") or 300),
             debug=_truthy(os.environ.get("ACPDBG_DEBUG"), False),
@@ -128,6 +150,7 @@ class Config:
             "ACPDBG_UNSAFE": "1" if self.unsafe else "0",
             "ACPDBG_CONTROL": "1" if self.allow_control else "0",
             "ACPDBG_AUTOSERVE": "1" if self.autoserve else "0",
+            "ACPDBG_SESSION": "1" if self.session else "0",
             "ACPDBG_AGENT_STDERR": "1" if self.agent_stderr else "0",
             "ACPDBG_TIMEOUT": str(self.prompt_timeout),
             "ACPDBG_DEBUG": "1" if self.debug else "0",

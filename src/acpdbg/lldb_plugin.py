@@ -23,9 +23,15 @@ import lldb
 from . import __version__
 from . import log as _log
 from .bridge import CommandBridge
-from .config import Config, ConfigError, resolve_session_command
+from .config import (
+    SESSION_PERSISTENT_ENV,
+    SESSION_TURN_END,
+    Config,
+    ConfigError,
+    resolve_session_command,
+)
 from .lldb_inspector import LLDBInspector
-from .prompts import build_initial_prompt
+from .prompts import build_followup_prompt, build_initial_prompt, build_restop_prompt
 
 # This module runs inside the debugger's embedded Python, which may be older than
 # the ACP SDK supports (Xcode's lldb ships Python 3.9). It therefore imports only
@@ -49,6 +55,10 @@ acpdbg — debug with your coding agent over ACP
   acpdbg <question>         same as `ask`
   acpdbg config             show current configuration
   acpdbg config <k> <v>     set a config value
+  acpdbg session            show the persistent agent conversation's status
+  acpdbg session start      open the agent conversation now (asks reuse it)
+  acpdbg session stop       end it (drops the agent's memory of this debug)
+  acpdbg session reset      fresh conversation without restarting the agent
   acpdbg serve              expose this session to an external MCP client
   acpdbg serve stop         stop exposing it
   acpdbg log [n]            show the last n lines of the debug log (default 40)
@@ -64,7 +74,12 @@ configured agent):
 
 config keys: agent, permission (auto|prompt), mcp (on|off),
              control (on|off), unsafe (on|off), writes (on|off),
-             autoserve (on|off), timeout <seconds>, debug (on|off)
+             session (on|off), autoserve (on|off),
+             timeout <seconds>, debug (on|off)
+
+By default (`session on`) the first ask opens one persistent agent conversation
+and later asks continue it: the agent remembers earlier turns and its startup
+cost is paid once. `session off` gives every ask a fresh one-shot agent.
 
 `debug on` makes every acpdbg process log to ~/.acpdbg/acpdbg.log — follow it
 from a terminal with `tail -f` to see exactly where a session stalls.
@@ -248,6 +263,9 @@ def _cmd_acpdbg(debugger, command, result, internal_dict) -> None:
     if verb == "config":
         _config(debugger, args[len("config"):].strip(), result)
         return
+    if verb == "session":
+        _session_cmd(debugger, args[len("session"):].strip(), result)
+        return
     if verb == "serve":
         _serve(debugger, args[len("serve"):].strip(), result)
         return
@@ -299,6 +317,42 @@ def _debug(debugger, question, result) -> None:
     if not inspector.is_debug_build():
         emit("acpdbg: warning — no debug info found; compile with -g for best results.\n")
 
+    try:
+        if _route_persistent(emit):
+            _debug_persistent(debugger, inspector, question, streaming, emit, result)
+        else:
+            _debug_oneshot(debugger, inspector, question, streaming, emit, result)
+    finally:
+        if not streaming:
+            block = "".join(notes) + _LAST_TRANSCRIPT
+            if block.strip():
+                result.AppendMessage(block)
+
+
+def _route_persistent(emit) -> bool:
+    """Whether this ask goes to the persistent conversation or a one-shot."""
+    if _session_running():
+        if _CONFIG.agent != _SESSION.agent:
+            emit(
+                f"acpdbg: asking '{_CONFIG.agent}' one-shot — the persistent session "
+                f"is with '{_SESSION.agent}' (`acpdbg session stop` to switch over).\n"
+            )
+            return False
+        return True
+    if not _CONFIG.session:
+        return False
+    if _CONFIG.permission_mode == "prompt":
+        # Interactive permission approval reads the console through the helper's
+        # stdin; a persistent helper's stdin is the command pipe instead.
+        emit(
+            "acpdbg: `permission prompt` needs the console, so this ask runs "
+            "one-shot (`acpdbg config permission auto` enables the persistent session).\n"
+        )
+        return False
+    return True
+
+
+def _debug_oneshot(debugger, inspector, question, streaming, emit, result) -> None:
     context = inspector.crash_context()
     prompt_text = build_initial_prompt(context, question)
 
@@ -351,10 +405,73 @@ def _debug(debugger, question, result) -> None:
         if bridge is not None:
             bridge.stop()
             _log.debug("plugin", "bridge stopped")
-        if not streaming:
-            block = "".join(notes) + _LAST_TRANSCRIPT
-            if block.strip():
-                result.AppendMessage(block)
+
+
+def _debug_persistent(debugger, inspector, question, streaming, emit, result) -> None:
+    global _IN_SESSION, _LAST_TRANSCRIPT
+    transcript = []
+    try:
+        sess = _SESSION
+        just_spawned = False
+        if sess is None:
+            emit(
+                f"\nacpdbg → {_CONFIG.agent} (starting the persistent session — "
+                "later asks reuse it)\n\n"
+            )
+            sess, error = _session_spawn(debugger, streaming, transcript)
+            if sess is None:
+                result.SetError(f"acpdbg: {error}{_log_hint()}")
+                return
+            just_spawned = True
+
+        # First turn gets the full captured context; follow-ups only the
+        # question — unless the program stopped anew since the last ask, in
+        # which case the agent needs fresh context.
+        generation = inspector.stop_generation()
+        if sess.turns == 0:
+            prompt_text = build_initial_prompt(inspector.crash_context(), question)
+        elif generation != sess.stop_generation:
+            prompt_text = build_restop_prompt(inspector.crash_context(), question)
+        else:
+            prompt_text = build_followup_prompt(question)
+        sess.stop_generation = generation
+
+        if not just_spawned:
+            emit(f"\nacpdbg → {sess.agent} (session turn {sess.turns + 1})\n\n")
+
+        handle = tempfile.NamedTemporaryFile(
+            "w", prefix="acpdbg-prompt-", suffix=".md", delete=False
+        )
+        _IN_SESSION = True
+        try:
+            handle.write(prompt_text)
+            handle.close()
+            _log.debug(
+                "plugin",
+                f"session turn {sess.turns + 1}: {len(prompt_text)} chars, question={question!r}",
+            )
+            status = _session_send(debugger, sess, f"PROMPT {handle.name}", streaming, transcript)
+        finally:
+            _IN_SESSION = False
+            try:
+                os.unlink(handle.name)
+            except OSError:
+                pass
+
+        if status is None:
+            _session_teardown()
+            result.SetError(
+                "acpdbg: the agent session ended unexpectedly (see output above)."
+                + _log_hint()
+            )
+            return
+        sess.turns += 1
+        if status != "ok":
+            result.SetError("acpdbg: the agent turn failed (see output above)." + _log_hint())
+    finally:
+        # Even a partial transcript should reach `acpdbg last` and, in
+        # non-streaming (Xcode) mode, the result block assembled by _debug.
+        _LAST_TRANSCRIPT = "".join(transcript)
 
 
 def _log_hint() -> str:
@@ -422,6 +539,243 @@ def _run_session_process(debugger, session_cmd, prompt_text, bridge_info, stream
             os.unlink(handle.name)
         except OSError:
             pass
+
+
+# --- persistent agent session ------------------------------------------------
+# One long-lived `acpdbg-session` helper (and thus one agent conversation) per
+# debugger session, opened lazily by the first ask when `config session` is on,
+# or explicitly with `acpdbg session start`. See the protocol notes in config.py.
+
+
+class _PersistentSession:
+    def __init__(self, proc, bridge, agent: str) -> None:
+        self.proc = proc          # the helper subprocess (stdin = command pipe)
+        self.bridge = bridge      # CommandBridge kept alive for the whole session
+        self.agent = agent        # agent the conversation was opened with
+        self.turns = 0
+        self.started = _time.time()
+        self.stop_generation = None
+
+
+_SESSION = None  # type: _PersistentSession | None
+
+
+def _session_running() -> bool:
+    """Whether the persistent helper is alive; reaps it silently if it died."""
+    global _SESSION
+    if _SESSION is None:
+        return False
+    if _SESSION.proc.poll() is not None:
+        _log.debug("plugin", f"session helper exited (code={_SESSION.proc.returncode})")
+        _session_teardown()
+        return False
+    return True
+
+
+def _session_teardown() -> None:
+    global _SESSION
+    sess, _SESSION = _SESSION, None
+    if sess is None:
+        return
+    _session_close(sess)
+
+
+def _session_close(sess) -> None:
+    try:
+        if sess.proc.stdin is not None:
+            sess.proc.stdin.close()  # EOF tells the helper to shut down
+    except (OSError, ValueError):
+        pass
+    if sess.proc.poll() is None:
+        try:
+            sess.proc.wait(timeout=5)
+        except Exception:
+            try:
+                sess.proc.kill()
+            except Exception:
+                pass
+    if sess.bridge is not None:
+        try:
+            sess.bridge.stop()
+        except Exception:
+            pass
+    _log.debug("plugin", "persistent session closed")
+
+
+def _session_spawn(debugger, streaming, transcript):
+    """Start helper + agent + conversation. Returns (session, None) or (None, error).
+
+    On success the session is registered as the module-wide _SESSION. Startup
+    output (heartbeat notes and any agent chatter) is forwarded like a turn.
+    """
+    global _SESSION
+    try:
+        session_cmd = resolve_session_command()
+    except ConfigError as exc:
+        return None, str(exc)
+
+    _log.debug("plugin", f"session spawn: agent={_CONFIG.agent}")
+    _log.debug("plugin", f"agent argv: {_CONFIG.describe_agent()}")
+    _log.debug("plugin", f"session helper: {' '.join(session_cmd)}")
+
+    # The bridge must outlive this call: its socket path is baked into the
+    # agent's MCP config at session/new, so it is owned by the session.
+    bridge = None
+    bridge_env = {}
+    if _CONFIG.use_mcp:
+        try:
+            inspector = LLDBInspector(debugger)
+            control = inspector.control if _CONFIG.allow_control else None
+            bridge = CommandBridge(inspector.run_command, control=control)
+            info = bridge.start()
+            bridge_env = info.env()
+            _log.debug("plugin", f"session bridge listening on {info.socket_path}")
+        except Exception:
+            _log.exception("plugin", "session bridge failed to start")
+            bridge = None
+            bridge_env = {}
+
+    env = dict(os.environ)
+    env.update(_CONFIG.to_env())
+    env[SESSION_PERSISTENT_ENV] = "1"
+    env["ACPDBG_COLOR"] = "1" if streaming else "0"
+    env.update(bridge_env)
+    try:
+        proc = subprocess.Popen(
+            session_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+        )
+    except OSError as exc:
+        if bridge is not None:
+            bridge.stop()
+        return None, f"failed to launch the session helper: {exc}"
+
+    sess = _PersistentSession(proc, bridge, _CONFIG.agent)
+    status = _session_read_turn(debugger, sess, streaming, transcript)
+    if status != "ready":
+        _session_close(sess)
+        return None, "the agent session failed to start (see output above)."
+    _SESSION = sess
+    _log.debug("plugin", f"persistent session ready (helper pid={proc.pid})")
+    return sess, None
+
+
+def _session_send(debugger, sess, command: str, streaming, transcript):
+    """Send one protocol command and forward output until the end-of-turn mark.
+
+    Returns the helper's status word, or None if the helper went away.
+    """
+    try:
+        sess.proc.stdin.write(command + "\n")
+        sess.proc.stdin.flush()
+    except (OSError, ValueError):
+        return None
+    return _session_read_turn(debugger, sess, streaming, transcript)
+
+
+def _session_read_turn(debugger, sess, streaming, transcript):
+    while True:
+        line = sess.proc.stdout.readline()
+        if not line:
+            return None
+        if line.startswith(SESSION_TURN_END):
+            return line[len(SESSION_TURN_END):].strip() or "ok"
+        if streaming:
+            _out(debugger, line)
+        transcript.append(line)
+        _log.debug("plugin", f"» {line.rstrip()}")
+
+
+def _session_cmd(debugger, args: str, result) -> None:
+    verb = args.split()[0] if args.split() else "status"
+    streaming = _console_isatty(debugger)
+
+    if verb == "status":
+        if _session_running():
+            sess = _SESSION
+            uptime = _time.time() - sess.started
+            result.AppendMessage(
+                f"acpdbg session: agent={sess.agent}, turns={sess.turns}, "
+                f"uptime={uptime:.0f}s, helper pid={sess.proc.pid}, "
+                f"debugger tools={'on' if sess.bridge is not None else 'off'}."
+            )
+        elif _CONFIG.session:
+            result.AppendMessage(
+                "acpdbg: no persistent session running — the first ask opens one "
+                "(config `session on`)."
+            )
+        else:
+            result.AppendMessage(
+                "acpdbg: no persistent session running, and config `session off` "
+                "makes every ask one-shot. `acpdbg session start` opens one anyway."
+            )
+        return
+
+    if verb == "start":
+        if _session_running():
+            result.AppendMessage(
+                "acpdbg: a persistent session is already running (`acpdbg session` for status)."
+            )
+            return
+        if _CONFIG.permission_mode == "prompt":
+            result.SetError(
+                "acpdbg: `permission prompt` needs the console and can't drive a "
+                "persistent session; run `acpdbg config permission auto` first."
+            )
+            return
+        transcript = []
+        sess, error = _session_spawn(debugger, streaming, transcript)
+        if not streaming and transcript:
+            result.AppendMessage("".join(transcript))
+        if sess is None:
+            result.SetError(f"acpdbg: {error}{_log_hint()}")
+        else:
+            result.AppendMessage(
+                f"acpdbg: session started with {sess.agent} — `ask` now continues "
+                "one conversation. `acpdbg session stop` ends it."
+            )
+        return
+
+    if verb == "stop":
+        if not _session_running():
+            result.AppendMessage("acpdbg: no persistent session is running.")
+            return
+        _session_teardown()
+        message = "acpdbg: session stopped."
+        if _CONFIG.session:
+            message += " The next ask opens a fresh one (`acpdbg config session off` to stay one-shot)."
+        result.AppendMessage(message)
+        return
+
+    if verb == "reset":
+        if not _session_running():
+            result.AppendMessage("acpdbg: no persistent session is running — nothing to reset.")
+            return
+        sess = _SESSION
+        transcript = []
+        status = _session_send(debugger, sess, "RESET", streaming, transcript)
+        if not streaming and transcript:
+            result.AppendMessage("".join(transcript))
+        if status == "ok":
+            sess.turns = 0
+            sess.stop_generation = None
+            result.AppendMessage(
+                "acpdbg: session reset — the agent forgot the conversation "
+                "(same agent process, so no startup cost)."
+            )
+        else:
+            _session_teardown()
+            result.SetError("acpdbg: reset failed; the session was stopped." + _log_hint())
+        return
+
+    result.SetError("usage: acpdbg session [start|stop|reset]")
 
 
 # A long-lived bridge exposed to *external* MCP clients via `acpdbg serve`.
@@ -539,6 +893,11 @@ def _apply_config(key: str, value: str) -> "str | None":
     on = value.lower() in ("on", "1", "true", "yes")
     if key == "agent":
         _CONFIG.agent = value
+        if _session_running() and _SESSION.agent != value:
+            return (
+                f"the persistent session still talks to '{_SESSION.agent}'; asks run "
+                f"one-shot with '{value}' until `acpdbg session stop`."
+            )
     elif key in ("permission", "permissions"):
         if value not in ("auto", "prompt"):
             raise ValueError("permission must be 'auto' or 'prompt'")
@@ -551,6 +910,10 @@ def _apply_config(key: str, value: str) -> "str | None":
         _CONFIG.unsafe = on
     elif key in ("writes", "allow_writes"):
         _CONFIG.allow_writes = on
+    elif key == "session":
+        _CONFIG.session = on
+        if not on and _session_running():
+            return "the running session stays until `acpdbg session stop`; new asks after that are one-shot."
     elif key == "autoserve":
         _CONFIG.autoserve = on
         if on and not _CONFIG.allow_control:
@@ -580,6 +943,8 @@ def _render_config() -> str:
         f"  autoserve  = {'on' if _CONFIG.autoserve else 'off'}\n"
         f"  unsafe     = {'on' if _CONFIG.unsafe else 'off'}\n"
         f"  writes     = {'on' if _CONFIG.allow_writes else 'off'}\n"
+        f"  session    = {'on' if _CONFIG.session else 'off'}"
+        f"{'  (running: ' + _SESSION.agent + ', ' + str(_SESSION.turns) + ' turns)' if _session_running() else ''}\n"
         f"  timeout    = {_CONFIG.prompt_timeout:g}s\n"
         f"  debug      = {'on  (log: ' + _log.log_path() + ')' if _CONFIG.debug else 'off'}"
     )

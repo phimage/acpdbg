@@ -59,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Expose the session to external MCP clients automatically whenever "
              "the program stops (implies --control). See `acpdbg serve`.",
     )
+    parser.add_argument(
+        "--no-session", action="store_true",
+        help="Give every ask a fresh one-shot agent instead of one persistent "
+             "conversation that remembers earlier answers.",
+    )
     parser.add_argument("--agent-stderr", action="store_true", help="Show the agent subprocess's stderr.")
     parser.add_argument(
         "--debug", action="store_true",
@@ -104,6 +109,8 @@ def _child_env(args: argparse.Namespace) -> dict[str, str]:
         env["ACPDBG_ALLOW_WRITES"] = "1"
     if args.autoserve:
         env["ACPDBG_AUTOSERVE"] = "1"
+    if args.no_session:
+        env["ACPDBG_SESSION"] = "0"
     if args.agent_stderr:
         env["ACPDBG_AGENT_STDERR"] = "1"
     if args.debug:
@@ -198,6 +205,8 @@ def lldbinit_env(args: argparse.Namespace) -> dict[str, str]:
         env["ACPDBG_ALLOW_WRITES"] = "1"
     if args.autoserve:
         env["ACPDBG_AUTOSERVE"] = "1"
+    if args.no_session:
+        env["ACPDBG_SESSION"] = "0"
     if args.agent_stderr:
         env["ACPDBG_AGENT_STDERR"] = "1"
     if args.debug:
