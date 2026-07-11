@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "acpdbg"
-version = "0.1.0"
+version = "0.1.1"
 description = "Debug native crashes by handing them to your coding agent over ACP (Agent Client Protocol)."
 readme = "README.md"
 requires-python = ">=3.10,<3.15"

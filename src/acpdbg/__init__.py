@@ -10,4 +10,4 @@ already use (GitHub Copilot CLI, Gemini CLI, the Claude Code ACP adapter, or the
 bundled zero-setup mock agent).
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

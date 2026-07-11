@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo.png">
-    <img src="assets/logo-light.png" alt="acpdbg" width="320">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/phimage/acpdbg/main/assets/logo.png">
+    <img src="https://raw.githubusercontent.com/phimage/acpdbg/main/assets/logo-light.png" alt="acpdbg" width="320">
   </picture>
 </p>
 
