@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/acpdbg/acpdbg"
+Homepage = "https://github.com/phimage/acpdbg"
 
 [project.scripts]
 acpdbg = "acpdbg.cli:main"
